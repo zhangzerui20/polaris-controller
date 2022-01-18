@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"github.com/polarismesh/polaris-controller/cmd/polaris-controller/app"
 	"github.com/polarismesh/polaris-controller/cmd/polaris-controller/app/options"
 	localCache "github.com/polarismesh/polaris-controller/pkg/cache"
 	"github.com/polarismesh/polaris-controller/pkg/metrics"
@@ -25,6 +26,7 @@ import (
 	"k8s.io/component-base/metrics/prometheus/ratelimiter"
 	"k8s.io/klog"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -55,6 +57,8 @@ type PolarisController struct {
 	// endpointsSynced returns true if the endpoints shared informer has been synced at least once.
 	// Added as a member to the struct to allow injection for testing.
 	endpointsSynced cache.InformerSynced
+
+	namespaceLister corelisters.NamespaceLister
 
 	namespaceSynced cache.InformerSynced
 
@@ -124,7 +128,8 @@ func NewPolarisController(podInformer coreinformers.PodInformer,
 	})
 
 	namespaceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: p.onNamespaceAdd,
+		AddFunc:    p.onNamespaceAdd,
+		UpdateFunc: p.onNamespaceUpdate,
 	})
 
 	p.serviceLister = serviceInformer.Lister()
@@ -136,6 +141,7 @@ func NewPolarisController(podInformer coreinformers.PodInformer,
 	p.endpointsLister = endpointsInformer.Lister()
 	p.endpointsSynced = endpointsInformer.Informer().HasSynced
 
+	p.namespaceLister = namespaceInformer.Lister()
 	p.namespaceSynced = namespaceInformer.Informer().HasSynced
 
 	p.eventBroadcaster = broadcaster
@@ -205,6 +211,12 @@ func (p *PolarisController) onServiceUpdate(old, current interface{}) {
 	//	return
 	//}
 
+	namespace, err := p.namespaceLister.Get(oldService.Namespace)
+	if err != nil {
+		klog.Errorf("Error get update service %v namespace, +v", old, err)
+		return
+	}
+
 	klog.V(6).Infof("Service %s/%s is update", curService.GetNamespace(), curService.GetName())
 	// 这里需要确认是否加入svc进行更新
 	// 1. 必须是polaris类型的才需要进行更新
@@ -212,13 +224,28 @@ func (p *PolarisController) onServiceUpdate(old, current interface{}) {
 	// 3. 如果: [old/polaris -> new/not polaris] 需要更新，相当与删除
 	// 4. 如果: [old/not polaris -> new/polaris] 相当于新建
 	// 5. 如果: [old/not polaris -> new/not polaris] 舍弃
-	oldIsPolaris := util.IsPolarisService(oldService)
-	curIsPolaris := util.IsPolarisService(curService)
+	oldIsPolaris := util.IsPolarisService(oldService, nil, "")
+	curIsPolaris := util.IsPolarisService(curService, namespace, p.config.PolarisController.SyncMode)
+
+	if p.config.PolarisController.SyncMode == app.SyncModeNamespace {
+		// 判断下，上一次 cache 中 namespace 的 sync 注解
+		sync, ok := p.serviceCache.Load(key)
+		if !ok {
+			// 找不到，则上次 store service 时，其 namespace 不是 polaris
+			oldIsPolaris = false
+		} else {
+			if sync.Annotations[util.PolarisSync] != app.IsEnableSync {
+				oldIsPolaris = false
+			}
+		}
+	}
+
 	if oldIsPolaris {
 		// 原来就是北极星类型的，增加cache
 		klog.Infof("Service %s is update polaris config", key)
 		metrics.SyncTimes.WithLabelValues("Update", "Service").Inc()
 		p.queue.Add(key)
+		oldService.Annotations[util.PolarisSync] = strconv.FormatBool(oldIsPolaris)
 		p.serviceCache.Store(key, oldService)
 	} else if curIsPolaris {
 		// 原来不是北极星的，新增是北极星的，入队列
@@ -279,6 +306,17 @@ func (p *PolarisController) onNamespaceAdd(obj interface{}) {
 	p.enqueueNamespace(key, namespace)
 }
 
+func (p *PolarisController) onNamespaceUpdate(old, cur interface{}) {
+	key, err := util.KeyFunc(cur)
+	if err != nil {
+		runtime.HandleError(fmt.Errorf("couldn't get key for object %+v: %v", cur, err))
+		return
+	}
+
+	namespace := cur.(*v1.Namespace)
+	p.enqueueNamespace(key, namespace)
+}
+
 func (p *PolarisController) onEndpointUpdate(old, cur interface{}) {
 	// 先确认service是否是Polaris的，后再做比较，会提高效率。
 	key, err := util.KeyFunc(cur)
@@ -333,6 +371,15 @@ func (p *PolarisController) enqueueNamespace(key string, namespace *v1.Namespace
 		klog.V(6).Infof("%s in ignore namespaces", key)
 		return
 	}
+
+	// 如果是 NAMESPACE 同步模式，需要过滤掉不需要加入的 ns
+	if p.config.PolarisController.SyncMode == app.SyncModeNamespace {
+		if !util.IsNamespacesNeedSync(namespace) {
+			return
+		}
+	}
+
+	// 这里是否需要将所有的 service 加入到队列中，加快下线实例的速度。没必要，利用 re sync 即可。
 	p.queue.Add(key)
 }
 
@@ -357,13 +404,19 @@ func (p *PolarisController) enqueueEndpoint(key string, endpoint *v1.Endpoints, 
 
 func (p *PolarisController) enqueueService(service *v1.Service, key string, eventType string) {
 
+	namespace, err := p.namespaceLister.Get(service.Namespace)
+	if err != nil {
+		klog.Errorf("get service %v namespace in enqueueService error, %v", service, err)
+		return
+	}
+
 	if eventType == "Add" {
 		// 如果是添加事件
-		if !util.IgnoreService(service) {
+		if !util.IgnoreService(service, namespace, p.config.PolarisController.SyncMode) {
 			return
 		}
 	} else {
-		if !util.IsPolarisService(service) {
+		if !util.IsPolarisService(service, namespace, p.config.PolarisController.SyncMode) {
 			return
 		}
 	}
@@ -461,6 +514,7 @@ func (p *PolarisController) syncService(key string) error {
 				processError)
 			return processError
 		}
+
 		p.serviceCache.Delete(key)
 	case err != nil:
 		klog.Errorf("Unable to retrieve service %v from store: %v", key, err)

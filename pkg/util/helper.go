@@ -18,6 +18,7 @@ package util
 
 import (
 	"fmt"
+	"github.com/polarismesh/polaris-controller/cmd/polaris-controller/app"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"net/http"
@@ -114,7 +115,7 @@ func IfNeedCreateServiceAlias(old, new *v1.Service) bool {
 }
 
 // 用于判断是是否满足创建PolarisService的要求字段，这块逻辑应该在webhook中也增加
-func IsPolarisService(svc *v1.Service) bool {
+func IsPolarisService(svc *v1.Service, namespace *v1.Namespace, syncMode string) bool {
 	// 默认忽略某些命名空间
 	for _, namespaces := range ignoredNamespaces {
 		if svc.GetNamespace() == namespaces {
@@ -134,14 +135,26 @@ func IsPolarisService(svc *v1.Service) bool {
 		return false
 	}
 
+	if syncMode == app.SyncModeNamespace {
+		if !IsNamespacesNeedSync(namespace) {
+			return false
+		}
+	}
+
 	return true
 }
 
 // IgnoreService 添加 service 时，忽略一些不需要处理的 service
-func IgnoreService(svc *v1.Service) bool {
+func IgnoreService(svc *v1.Service, namespace *v1.Namespace, syncMode string) bool {
 	// 默认忽略某些命名空间
 	for _, namespaces := range ignoredNamespaces {
 		if svc.GetNamespace() == namespaces {
+			return false
+		}
+	}
+
+	if syncMode == app.SyncModeNamespace {
+		if !IsNamespacesNeedSync(namespace) {
 			return false
 		}
 	}
@@ -183,4 +196,14 @@ func GetWeightFromService(svc *v1.Service) int {
 		}
 	}
 	return DefaultWeight
+}
+
+func IsNamespacesNeedSync(namespace *v1.Namespace) bool {
+	sync, ok := namespace.Annotations[PolarisSync]
+	// 注解不存在或者不需要同步
+	if !ok || sync != app.IsEnableSync {
+		return false
+	} else {
+		return true
+	}
 }

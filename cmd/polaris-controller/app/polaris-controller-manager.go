@@ -52,6 +52,10 @@ const (
 	MeshFile   = "/etc/polaris-inject/config/mesh"
 	CertFile   = "/etc/polaris-inject/certs/cert.pem"
 	KeyFile    = "/etc/polaris-inject/certs/key.pem"
+
+	SyncModeAll       = "ALL"
+	SyncModeNamespace = "NAMESPACE"
+	IsEnableSync      = "true"
 )
 
 var (
@@ -64,6 +68,7 @@ var (
 		monitoringPort int
 
 		polarisServerAddress string
+		syncMode             string
 	}{
 		loggingOptions: log.DefaultOptions(),
 	}
@@ -117,6 +122,11 @@ func NewPolarisControllerManagerCommand() *cobra.Command {
 			c, err := s.Config()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+
+			if flags.syncMode != SyncModeAll || flags.syncMode != SyncModeNamespace {
+				fmt.Fprintf(os.Stderr, "invalid value of syncMode.")
 				os.Exit(1)
 			}
 
